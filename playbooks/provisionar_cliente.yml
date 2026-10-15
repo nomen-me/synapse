@@ -1,0 +1,126 @@
+---
+# Template Semaphore: "Provisionar Cliente"
+# Survey vars esperadas: vps_ip (obrigatória), dominio (obrigatória),
+# nome_loja (opcional)
+#
+# AVISO — LEIA ANTES DE ADICIONAR AO REPO:
+# Este playbook assume que o Semaphore passa survey vars como extra-vars
+# pro playbook (comportamento padrão documentado do Task Template), e usa
+# "add_host" pra registrar a VPS do cliente como host de destino em tempo
+# de execução — é a técnica padrão do Ansible pra "host alvo definido em
+# runtime por uma variável", e não depende de nenhum comportamento
+# Semaphore-específico não confirmado. Ainda assim, teste numa VPS de
+# teste antes de confiar nisso em produção (ver checklist de testes).
+#
+# Este playbook SÓ executa provisionar_cliente_synapse2.sh como já existe
+# hoje — não reimplementa o provisionamento (conforme pedido).
+
+- name: "Synapse - registrar VPS de destino"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Versao fixa do Synapse - ler o commit do codigo que esta sendo executado
+      ansible.builtin.command: git -C "{{ playbook_dir }}/.." rev-parse HEAD
+      register: synapse_head
+      changed_when: false
+    - name: Versao fixa do Synapse - o codigo executado TEM que ser o commit fixado (sem mudanca silenciosa)
+      ansible.builtin.assert:
+        that:
+          - synapse_commit is defined
+          - synapse_commit | length == 40
+          - synapse_head.stdout == synapse_commit
+        fail_msg: "Codigo executado ({{ synapse_head.stdout }}) difere do commit fixado ({{ synapse_commit | default('AUSENTE') }}). Repositorio mudou? Reexecute o instalador central para fixar uma nova versao DELIBERADAMENTE."
+        success_msg: "Synapse commit instalado: {{ synapse_head.stdout }}"
+    - name: Registrar o commit instalado
+      ansible.builtin.debug:
+        msg: "Synapse commit instalado: {{ synapse_head.stdout }}"
+
+    - name: Validar parâmetros obrigatórios
+      ansible.builtin.fail:
+        msg: "vps_ip e dominio são obrigatórios (survey vars do template)."
+      when: (vps_ip is not defined) or (dominio is not defined) or (vps_ip | length == 0) or (dominio | length == 0)
+
+    - name: Registrar host dinamicamente
+      ansible.builtin.add_host:
+        name: cliente_alvo
+        ansible_host: "{{ vps_ip }}"
+        ansible_user: root
+        groups: alvo
+
+- name: "Synapse - Provisionar Cliente Novo em {{ vps_ip }}"
+  hosts: alvo
+  gather_facts: false
+  become: true
+  vars:
+    nome_loja_efetivo: "{{ nome_loja | default(dominio) }}"
+  environment:
+    LYRA_CENTRAL_URL: "{{ LYRA_CENTRAL_URL }}"
+    LYRA_ADMIN_API_KEY: "{{ LYRA_ADMIN_API_KEY }}"
+    GITHUB_TOKEN: "{{ GITHUB_TOKEN }}"
+    SYNAPSE_PAINEL_REF: "{{ SYNAPSE_PAINEL_REF | default('') }}"
+  tasks:
+    - name: Testar conectividade SSH e privilégio de root
+      ansible.builtin.ping:
+      register: teste_conectividade
+
+    - name: Falhar cedo e claramente se a conectividade não estiver ok
+      ansible.builtin.fail:
+        msg: "Não consegui conectar via SSH em {{ vps_ip }} com a chave 'ssh-clientes'. Confirme que a chave pública está em /root/.ssh/authorized_keys nessa VPS antes de continuar."
+      when: teste_conectividade is failed
+
+    - name: Copiar o instalador (provisionar_cliente_synapse2.sh) pra VPS do cliente
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../provisionar_cliente_synapse2.sh"
+        dest: /root/provisionar_cliente_synapse2.sh
+        mode: "0700"
+
+    - name: Executar o provisionamento (pode levar vários minutos)
+      ansible.builtin.command:
+        cmd: >
+          bash /root/provisionar_cliente_synapse2.sh
+          "{{ dominio }}" "{{ nome_loja_efetivo }}"
+      register: resultado
+      changed_when: true
+      failed_when: resultado.rc != 0
+
+    - name: Mostrar saída completa do provisionamento
+      ansible.builtin.debug:
+        var: resultado.stdout_lines
+
+    - name: Confirmar explicitamente sucesso ou falha (não silencioso)
+      ansible.builtin.fail:
+        msg: "Provisionamento de {{ dominio }} FALHOU (código {{ resultado.rc }}). Ver saída acima antes de considerar o cliente pronto."
+      when: resultado.rc != 0
+
+# =============================================================================
+# Registro automático em inventory/clientes_ativos.yml — só roda se o
+# provisionamento acima teve sucesso. Sem isso, o cliente novo nunca
+# entraria na rotação de backup/manutenção sem edição manual do inventário,
+# que é exatamente o trabalho que este pacote existe pra eliminar.
+#
+# LIMITAÇÃO ASSUMIDA E DECLARADA: esta etapa reescreve o YAML inteiro via
+# PyYAML (carrega, insere o host se ainda não existir, salva) — comentários
+# manuais no arquivo não sobrevivem a partir daqui (ver aviso no topo do
+# próprio inventory/clientes_ativos.yml). Não implementei travamento contra
+# duas execuções simultâneas do template "Provisionar Cliente" tentando
+# commitar ao mesmo tempo (condição de corrida real se dois provisionamentos
+# terminarem no mesmo instante) — o "git push --ff-only" abaixo detecta o
+# conflito e RECUSA sobrescrever, mas não resolve sozinho; nesse caso raro,
+# rode o registro de novo manualmente (fica pendente, não corrompe nada).
+# =============================================================================
+- name: "Synapse - Registrar {{ dominio }} no inventario (branch {{ inventory_branch | default('inventario') }}) com reaplicacao sob concorrencia"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Registrar (clona a ponta atual, reaplica, empurra; repete se outra atualizacao chegou antes)
+      ansible.builtin.command:
+        cmd: >
+          bash {{ playbook_dir }}/../scripts/registrar_inventario_com_retry.sh
+          {{ dominio }} {{ vps_ip }} "{{ nome_loja | default(dominio) }}"
+      environment:
+        GITHUB_TOKEN: "{{ GITHUB_TOKEN }}"
+        INV_BRANCH: "{{ inventory_branch | default('inventario') }}"
+        INV_REPO_URL: "{{ inventory_repo_url | default('') }}"
+      register: registro_inventario
+      changed_when: "'ADICIONADO' in registro_inventario.stdout"
+      # FALHA e FALHA: cliente nao pode ficar fora do inventario sem o provisionamento acusar
