@@ -415,7 +415,7 @@ cancao_validar() {
   local RIT="https://${DOMINIO_ERP}/api/method/synapse_core.api"
   # 1) workflows da Cancao existem e estao ativos
   if [ -n "${N8N_API_KEY:-}" ]; then
-    R=$(curl -s -m 30 -H "X-N8N-API-KEY: ${N8N_API_KEY}" "https://${DOMINIO_N8N}/api/v1/workflows?limit=250" | python3 -c "
+    R=$(curl -s -m 30 -H "X-N8N-API-KEY: ${N8N_API_KEY}" "${N8N_INT:-https://${DOMINIO_N8N}}/api/v1/workflows?limit=250" | python3 -c "
 import sys,json
 try: d=json.load(sys.stdin).get('data',[])
 except Exception: d=[]
@@ -744,6 +744,19 @@ if [ "$(node_major_atual)" -lt 20 ]; then
   fatal "Node.js >= 20 nao foi instalado (o install.sh da Lyra Central exige). Veja a saida do 'apt-cache policy nodejs' acima."
 fi
 ok "Node.js $(node -v) OK ($(command -v node))"
+
+# Pre-voo de DNS (so avisa, nao bloqueia): os certificados Let's Encrypt so saem se cada
+# subdominio apontar para esta VPS. Subdominio sem registro = HTTPS falhando (HTTP 000) la na frente.
+_IP_PUB="$(curl -s -m 6 https://api.ipify.org 2>/dev/null || curl -s -m 6 https://ifconfig.me 2>/dev/null)"
+if [ -n "$_IP_PUB" ]; then
+  for _h in "${DOMINIO_ERP}" "${DOMINIO_N8N}" "${DOMINIO_CHAT}" "${DOMINIO_LYRA}" "${DOMINIO_PAINEL}" "${DOMINIO_NETDATA}" "${DOMINIO_UPTIME}"; do
+    _r="$(getent ahostsv4 "$_h" 2>/dev/null | awk 'NR==1{print $1}')"
+    if [ "$_r" = "$_IP_PUB" ]; then ok "DNS ${_h} -> ${_r}"
+    else warn "DNS ${_h} -> ${_r:-SEM REGISTRO} (esta VPS e ${_IP_PUB}). Sem o registro A correto o certificado HTTPS NAO sera emitido."; fi
+  done
+else
+  warn "Nao consegui descobrir o IP publico desta VPS; pulando a checagem de DNS."
+fi
 
 systemctl enable --now redis-server
 if redis-cli ping >/dev/null 2>&1; then
@@ -1743,6 +1756,20 @@ def main():
     # Site criado sem o Setup Wizard nao tem o Warehouse Type "Transit", e o ERPNext
     # o exige ao criar o armazem "Goods In Transit" da Empresa. Sem isso a criacao
     # falha com "Could not find Warehouse Type: Transit". Idempotente.
+    # O Setup Wizard tambem cria os cadastros-base (Item Groups, UOM "Nos", Customer Group,
+    # Territory...). Num site sem wizard NAO existe nenhum Item Group, e tudo que cria
+    # item/cliente depois (inclusive o teste de ciclo) falha. Rodamos a mesma rotina de
+    # fixtures do proprio ERPNext, so se ainda nao houver nenhum Item Group.
+    try:
+        if not frappe.db.count("Item Group"):
+            from erpnext.setup.setup_wizard.operations import install_fixtures
+            install_fixtures.install("Brazil")
+            frappe.db.commit()
+            print("SYNAPSE_KV|fixtures|instaladas")
+    except Exception as _e:
+        frappe.db.rollback()
+        print("SYNAPSE_KV|fixtures_erro|" + repr(_e)[:200])
+
     if not frappe.db.exists("Warehouse Type", "Transit"):
         frappe.get_doc({"doctype": "Warehouse Type", "name": "Transit"}).insert(ignore_permissions=True)
         frappe.db.commit()
@@ -2567,7 +2594,20 @@ EOF
   sleep 2
   PAINEL_H_HOST="$(sha256sum /home/ubuntu/painel/site/index.html | awk '{print $1}')"
   PAINEL_H_CONT="$(docker exec painel sha256sum /usr/share/nginx/html/index.html 2>/dev/null | awk '{print $1}')"
-  PAINEL_H_HTTPS="$(curl -fsSL "https://${DOMINIO_PAINEL}/" 2>/dev/null | sha256sum | awk '{print $1}')"
+  # Na 1a publicacao o Traefik ainda precisa emitir o certificado (Let's Encrypt); ate la o curl
+  # falha e o corpo vem vazio (sha256 e3b0c442...). Espera ate 3 min pelo conteudo certo.
+  log "Aguardando o HTTPS do Painel responder com o arquivo novo (certificado na 1a publicacao; ate 3 min)..."
+  PAINEL_H_HTTPS=""
+  for _t in $(seq 1 36); do
+    PAINEL_H_HTTPS="$(curl -fsSL -m 10 "https://${DOMINIO_PAINEL}/" 2>/dev/null | sha256sum | awk '{print $1}')"
+    [ "$PAINEL_H_HTTPS" = "$PAINEL_H_HOST" ] && break
+    sleep 5
+  done
+  if [ "$PAINEL_H_HTTPS" != "$PAINEL_H_HOST" ]; then
+    warn "  curl: $(curl -sS -m 8 -o /dev/null "https://${DOMINIO_PAINEL}/" 2>&1 | tail -1 | cut -c1-200)"
+    warn "  DNS de ${DOMINIO_PAINEL}: $(getent ahostsv4 "${DOMINIO_PAINEL}" 2>/dev/null | awk 'NR==1{print $1}') (deve ser o IP publico desta VPS)"
+    warn "  Traefik: $(docker logs traefik 2>&1 | grep -iE 'acme|unable to obtain|certificate' | tail -2 | cut -c1-220 | tr '\n' ' ')"
+  fi
   log "PANEL_DEPLOY_OK candidato — host_hash=${PAINEL_H_HOST} container_hash=${PAINEL_H_CONT:-vazio} https_hash=${PAINEL_H_HTTPS:-vazio}"
   if [ -n "$PAINEL_H_HOST" ] && [ "$PAINEL_H_HOST" = "$PAINEL_H_CONT" ] && [ "$PAINEL_H_HOST" = "$PAINEL_H_HTTPS" ]; then
     ok "Painel publicado e validado em https://${DOMINIO_PAINEL} — host, container e HTTPS servem o mesmo arquivo (${PAINEL_H_HOST})"
@@ -2852,48 +2892,81 @@ if [ -n "$WORKFLOWS_DIR" ] && [ -d "$WORKFLOWS_DIR" ]; then
   # tentar — tentar isso logo depois do "docker compose up -d" é o motivo
   # mais comum de falha (container ainda migrando o banco), não o formato
   # do endpoint em si.
-  log "Aguardando o Harmonia (n8n) responder em ${N8N_BASE}/healthz..."
-  N8N_PRONTO=false
-  for _tentativa in $(seq 1 30); do
-    if curl -fsS -o /dev/null "${N8N_BASE}/healthz" 2>/dev/null; then
-      N8N_PRONTO=true
-      break
-    fi
-    sleep 3
+  # O Traefik so publica /webhook, /webhook-test, /api/v1 e /healthz do Harmonia (a GUI e o
+  # /rest/* sao escondidos de proposito). Por isso a criacao do owner e da API key NAO pode
+  # ir por https://${DOMINIO_N8N}: o /rest/* cai no "blackhole 404". Falamos com o n8n pelo
+  # IP do container na rede docker (o host alcanca o bridge), sem expor nada novo.
+  N8N_INT=""
+  for _t in $(seq 1 30); do
+    _ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' harmonia 2>/dev/null | awk '{print $1}')
+    if [ -n "$_ip" ]; then N8N_INT="http://${_ip}:5678"; break; fi
+    sleep 2
   done
-  if [ "$N8N_PRONTO" = false ]; then
-    warn "n8n não respondeu em /healthz depois de 90s — tentando gerar a API key mesmo assim (pode falhar por isso)."
-  else
-    ok "n8n respondendo em /healthz"
-  fi
+  [ -z "$N8N_INT" ] && warn "Nao achei o IP do container 'harmonia' (docker ps -a | grep harmonia) - nao da pra gerar a API key do N8N."
+
+  # /healthz responde 200 ainda durante as migracoes do banco; /healthz/readiness so depois.
+  log "Aguardando o Harmonia (n8n) ficar pronto em ${N8N_INT:-?} (/healthz/readiness)..."
+  N8N_PRONTO=false
+  for _t in $(seq 1 90); do
+    if [ -n "$N8N_INT" ] && [ "$(curl -s -o /dev/null -m 3 -w '%{http_code}' "${N8N_INT}/healthz/readiness" 2>/dev/null)" = "200" ]; then N8N_PRONTO=true; break; fi
+    sleep 2
+  done
+  [ "$N8N_PRONTO" = true ] && ok "n8n pronto (${N8N_INT})" || warn "n8n nao ficou pronto em 3 min - tentando gerar a API key mesmo assim (veja: docker logs harmonia --tail 50)."
+
+  # n8n exige senha com >=1 maiuscula e >=1 numero; a SENHA aleatoria (24 alfanumericos) nao
+  # garante isso em ~1,4% dos casos. O sufixo garante (so o owner de automacao usa esta senha).
+  N8N_OWNER_SENHA="${SENHA}Aa1"
+  _n8n_token_de() { grep -i '^set-cookie: *n8n-auth=' "$1" 2>/dev/null | head -1 | sed -E 's/^[^=]*=([^;]*).*/\1/' | tr -d '\r\n'; }
+  _n8n_api_ok()   { [ "$(curl -s -o /dev/null -m 10 -w '%{http_code}' -H "X-N8N-API-KEY: $1" "${N8N_INT}/api/v1/workflows?limit=1" 2>/dev/null)" = "200" ]; }
 
   N8N_API_KEY=""
-  for _tentativa in 1 2 3; do
-    COOKIEJAR="/tmp/synapse_n8n_cookie_$$"
+  # Reaproveita a chave de uma execucao anterior, se ainda valer (evita login/novas chaves a cada rerun).
+  _k_ant="$(ler_credencial_existente N8N_API_KEY 2>/dev/null || true)"
+  if [ -n "$_k_ant" ] && [ -n "$N8N_INT" ] && _n8n_api_ok "$_k_ant"; then
+    N8N_API_KEY="$_k_ant"; ok "API key do N8N de uma execucao anterior ainda e valida - reaproveitada"
+  fi
 
-    HTTP_SETUP=$(curl -s -o /tmp/synapse_n8n_setup.json -w '%{http_code}' -c "$COOKIEJAR" \
-      -X POST "${N8N_BASE}/rest/owner/setup" -H 'Content-Type: application/json' \
-      -d "{\"email\":\"${N8N_AUTOMACAO_EMAIL}\",\"firstName\":\"Synapse\",\"lastName\":\"Automacao\",\"password\":\"${SENHA}\"}")
+  if [ -z "$N8N_API_KEY" ] && [ -n "$N8N_INT" ]; then
+   for _tentativa in 1 2 3; do
+    TOKEN=""; rm -f /tmp/synapse_n8n_h.txt
+    HTTP_SETUP=$(curl -s -m 30 -D /tmp/synapse_n8n_h.txt -o /tmp/synapse_n8n_setup.json -w '%{http_code}' \
+      -X POST "${N8N_INT}/rest/owner/setup" -H 'Content-Type: application/json' \
+      -d "$(python3 -c 'import json,sys; print(json.dumps({"email":sys.argv[1],"firstName":"Synapse","lastName":"Automacao","password":sys.argv[2]}))' "$N8N_AUTOMACAO_EMAIL" "$N8N_OWNER_SENHA")")
+    [ "$HTTP_SETUP" = "200" ] && TOKEN="$(_n8n_token_de /tmp/synapse_n8n_h.txt)"
 
-    if [ "$HTTP_SETUP" != "200" ]; then
-      # owner já pode existir de um rerun anterior — tenta login em vez de
-      # setup, e mostra o corpo real de cada resposta pra não ficar cego
-      # sobre qual dos dois passos falhou e por quê.
-      HTTP_LOGIN=$(curl -s -o /tmp/synapse_n8n_login.json -w '%{http_code}' -c "$COOKIEJAR" \
-        -X POST "${N8N_BASE}/rest/login" -H 'Content-Type: application/json' \
-        -d "{\"email\":\"${N8N_AUTOMACAO_EMAIL}\",\"password\":\"${SENHA}\"}")
-      if [ "$HTTP_LOGIN" != "200" ]; then
-        warn "Tentativa ${_tentativa}/3: setup=HTTP ${HTTP_SETUP} ($(cat /tmp/synapse_n8n_setup.json 2>/dev/null | head -c 200)), login=HTTP ${HTTP_LOGIN} ($(cat /tmp/synapse_n8n_login.json 2>/dev/null | head -c 200))"
-        rm -f "$COOKIEJAR"
-        sleep 5
-        continue
+    if [ -z "$TOKEN" ]; then
+      # owner ja existe (rerun): login. O n8n 2.x exige o campo "emailOrLdapLoginId" (so "email" da 400).
+      HTTP_LOGIN="-"
+      for _pw in "$N8N_OWNER_SENHA" "$SENHA"; do
+        rm -f /tmp/synapse_n8n_h.txt
+        HTTP_LOGIN=$(curl -s -m 30 -D /tmp/synapse_n8n_h.txt -o /tmp/synapse_n8n_login.json -w '%{http_code}' \
+          -X POST "${N8N_INT}/rest/login" -H 'Content-Type: application/json' \
+          -d "$(python3 -c 'import json,sys; print(json.dumps({"email":sys.argv[1],"emailOrLdapLoginId":sys.argv[1],"password":sys.argv[2]}))' "$N8N_AUTOMACAO_EMAIL" "$_pw")")
+        if [ "$HTTP_LOGIN" = "200" ]; then TOKEN="$(_n8n_token_de /tmp/synapse_n8n_h.txt)"; [ -n "$TOKEN" ] && break; fi
+      done
+      if [ -z "$TOKEN" ]; then
+        warn "Tentativa ${_tentativa}/3: setup=HTTP ${HTTP_SETUP} ($(head -c 200 /tmp/synapse_n8n_setup.json 2>/dev/null)), login=HTTP ${HTTP_LOGIN} ($(head -c 200 /tmp/synapse_n8n_login.json 2>/dev/null))"
+        sleep 5; continue
       fi
     fi
 
-    HTTP_KEY=$(curl -s -b "$COOKIEJAR" -o /tmp/synapse_n8n_key.json -w '%{http_code}' \
-      -X POST "${N8N_BASE}/rest/api-keys" \
-      -H 'Content-Type: application/json' -d '{"label":"synapse-provisionamento"}')
-    rm -f "$COOKIEJAR"
+    # O cookie do n8n e "Secure": o curl nao o reenviaria por http:// para um IP que nao seja
+    # localhost, entao vai explicito no header. O n8n 2.x tambem exige "scopes" (e "expiresAt")
+    # no corpo; pegamos a lista permitida do proprio n8n.
+    SCOPES_JSON=$(curl -s -m 20 -H "Cookie: n8n-auth=${TOKEN}" "${N8N_INT}/rest/api-keys/scopes" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin); d = d.get('data', d)
+    print(json.dumps([x for x in d if isinstance(x, str)]))
+except Exception:
+    print('[]')" 2>/dev/null)
+    if [ -z "$SCOPES_JSON" ] || [ "$SCOPES_JSON" = "[]" ]; then
+      SCOPES_JSON='["workflow:create","workflow:read","workflow:update","workflow:list","workflow:delete","workflow:activate","workflow:deactivate"]'
+    fi
+
+    HTTP_KEY=$(curl -s -m 30 -H "Cookie: n8n-auth=${TOKEN}" -o /tmp/synapse_n8n_key.json -w '%{http_code}' \
+      -X POST "${N8N_INT}/rest/api-keys" -H 'Content-Type: application/json' \
+      -d "$(python3 -c 'import json,sys; print(json.dumps({"label":sys.argv[1],"scopes":json.loads(sys.argv[2]),"expiresAt":None}))' "synapse-provisionamento-$(date +%s)" "$SCOPES_JSON")")
 
     if [ "$HTTP_KEY" = "200" ] || [ "$HTTP_KEY" = "201" ]; then
       N8N_API_KEY=$(python3 -c "
@@ -2907,20 +2980,22 @@ try:
 except Exception:
     pass
 " 2>/dev/null)
-      [ -n "$N8N_API_KEY" ] && break
-      warn "Tentativa ${_tentativa}/3: /rest/api-keys respondeu HTTP ${HTTP_KEY} mas sem chave reconhecível no corpo: $(cat /tmp/synapse_n8n_key.json 2>/dev/null | head -c 200)"
+      if [ -n "$N8N_API_KEY" ] && _n8n_api_ok "$N8N_API_KEY"; then break; fi
+      warn "Tentativa ${_tentativa}/3: chave criada mas a API publica nao a aceitou."
+      N8N_API_KEY=""
     else
-      warn "Tentativa ${_tentativa}/3: /rest/api-keys respondeu HTTP ${HTTP_KEY}: $(cat /tmp/synapse_n8n_key.json 2>/dev/null | head -c 200)"
+      warn "Tentativa ${_tentativa}/3: /rest/api-keys respondeu HTTP ${HTTP_KEY}: $(head -c 200 /tmp/synapse_n8n_key.json 2>/dev/null)"
     fi
     sleep 5
-  done
+   done
+  fi
 
   if [ -n "$N8N_API_KEY" ]; then
     salvar_credencial "N8N_API_KEY" "$N8N_API_KEY"
     ok "API key pública do N8N gerada automaticamente"
 
     log "Importando workflows de ${WORKFLOWS_DIR}..."
-    N8N_URL="$N8N_BASE" N8N_API_KEY="$N8N_API_KEY" python3 - "$WORKFLOWS_DIR" <<'PYEOF'
+    N8N_URL="${N8N_INT:-$N8N_BASE}" N8N_API_KEY="$N8N_API_KEY" python3 - "$WORKFLOWS_DIR" <<'PYEOF'
 import os, sys, json, glob, urllib.request, urllib.error
 
 N8N_URL = os.environ.get("N8N_URL", "").rstrip("/")
@@ -3197,16 +3272,29 @@ log "Validando serviços instalados..."
 sleep 10
 check_service() {
   local nome=$1 url=$2 auth="${3:-}"
-  local code
-  if [ -n "$auth" ]; then
-    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 -u "$auth" "$url" 2>/dev/null)
-  else
-    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$url" 2>/dev/null)
-  fi
+  local code="000" tentativas=3 esp=5 i
+  # HTTPS publico: na 1a vez o Traefik ainda esta emitindo o certificado Let's Encrypt;
+  # ate la o curl falha (HTTP 000). Espera ate ~2 min antes de dar o servico como falho.
+  case "$url" in https://*) tentativas=12; esp=10 ;; esac
+  for i in $(seq 1 "$tentativas"); do
+    if [ -n "$auth" ]; then
+      code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 -u "$auth" "$url" 2>/dev/null)
+    else
+      code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$url" 2>/dev/null)
+    fi
+    [[ "$code" == "200" || "$code" == "301" || "$code" == "302" ]] && break
+    [ "$i" -lt "$tentativas" ] && sleep "$esp"
+  done
   if [[ "$code" == "200" || "$code" == "301" || "$code" == "302" ]]; then
     ok "$nome respondeu HTTP $code"
   else
     err "$nome não respondeu correctamente (HTTP $code) — verifica DNS e logs do container"
+    case "$url" in https://*)
+      local h="${url#https://}"; h="${h%%/*}"
+      warn "  curl: $(curl -sS -m 8 -o /dev/null "$url" 2>&1 | tail -1 | cut -c1-200)"
+      warn "  DNS de ${h}: $(getent ahostsv4 "$h" 2>/dev/null | awk 'NR==1{print $1}') (deve ser o IP publico desta VPS)"
+      warn "  Traefik: $(docker logs traefik 2>&1 | grep -iE 'acme|unable to obtain|certificate' | tail -2 | cut -c1-220 | tr '\n' ' ')" ;;
+    esac
   fi
 }
 check_service "Lyra Central — local"       "http://127.0.0.1:8080/healthz"
