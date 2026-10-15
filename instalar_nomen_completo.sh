@@ -714,13 +714,36 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 ok "Docker disponível: $(docker --version)"
 
-if ! command -v node >/dev/null 2>&1 || [ "$(node -v | sed 's/^v//' | cut -d. -f1)" -lt 20 ]; then
-  log "Instalando Node.js 20 (NodeSource, pra Lyra Central)..."
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - || fatal "Falha ao configurar o repositório NodeSource."
+# Node >= 20 e exigido pelo install.sh da Lyra Central. O Node 20 saiu de suporte em
+# 30/04/2026 e o script "setup_20.x" do NodeSource esta depreciado; instalamos o Node 22
+# (LTS) direto do repositorio NodeSource. O Ubuntu 24.04 traz Node 18.19.1 por padrao,
+# que e o que aparece se o NodeSource nao entrar - por isso verificamos no fim.
+NODE_MAJOR_ALVO=22
+node_major_atual() { local v; v="$(command -v node >/dev/null 2>&1 && node -v 2>/dev/null | sed 's/^v//' | cut -d. -f1)"; echo "${v:-0}"; }
+if [ "$(node_major_atual)" -lt 20 ]; then
+  log "Instalando Node.js ${NODE_MAJOR_ALVO} (repositorio NodeSource, pra Lyra Central)..."
   esperar_apt_livre
-  apt install -y nodejs || fatal "Falha ao instalar Node.js."
+  apt install -y ca-certificates curl gnupg || fatal "Falha ao instalar dependencias do repositorio NodeSource."
+  # Remove restos do setup_20.x / de pacotes do Ubuntu que conflitam com o nodejs do NodeSource
+  rm -f /etc/apt/sources.list.d/nodesource.list /etc/apt/sources.list.d/nodesource.sources
+  apt purge -y npm libnode-dev nodejs-doc >/dev/null 2>&1 || true
+  mkdir -p /etc/apt/keyrings
+  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor --yes -o /etc/apt/keyrings/nodesource.gpg \
+    || fatal "Falha ao baixar a chave do repositorio NodeSource."
+  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR_ALVO}.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
+  # Prioriza o nodejs do NodeSource sobre o do Ubuntu (18.19.1)
+  printf 'Package: nodejs\nPin: origin deb.nodesource.com\nPin-Priority: 1001\n' > /etc/apt/preferences.d/nodejs
+  esperar_apt_livre
+  apt update || fatal "Falha no apt update apos adicionar o repositorio NodeSource."
+  apt install -y nodejs || fatal "Falha ao instalar Node.js ${NODE_MAJOR_ALVO}."
+  hash -r
 fi
-ok "Node.js $(node -v) OK"
+if [ "$(node_major_atual)" -lt 20 ]; then
+  err "node no PATH: $(command -v node) -> $(node -v 2>/dev/null)"
+  apt-cache policy nodejs 2>/dev/null | head -12
+  fatal "Node.js >= 20 nao foi instalado (o install.sh da Lyra Central exige). Veja a saida do 'apt-cache policy nodejs' acima."
+fi
+ok "Node.js $(node -v) OK ($(command -v node))"
 
 systemctl enable --now redis-server
 if redis-cli ping >/dev/null 2>&1; then
