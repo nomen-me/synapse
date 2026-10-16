@@ -437,10 +437,28 @@ except Exception: print('erro')")
 try: print(json.load(sys.stdin)['data'][0]['name'])
 except Exception: print('')")
   if [ -z "$GRP" ]; then cancao_check FAIL "ciclo Ritmo->Harmonia" "nenhum Item Group folha para o teste"; else
-    curl -s -m 30 -o /dev/null -H "$AUTH" -H 'Content-Type: application/json' -X POST "https://${DOMINIO_ERP}/api/resource/Item" \
-      -d "{\"item_code\":\"${CODE}\",\"item_name\":\"${CODE}\",\"item_group\":\"${GRP}\",\"stock_uom\":\"Nos\",\"is_stock_item\":0}"
-    local i ST="" GA=""
-    for i in $(seq 1 40); do
+    # O usuario de automacao (System Manager + Synapse Automacao) NAO tem permissao para criar Item:
+    # o POST antigo devolvia 403 "No permission for Item" (escondido por -o /dev/null) e o teste
+    # terminava em 'ausente' porque o Outbox nunca recebia evento. O gatilho agora e criado pelo
+    # Administrator (bench execute); o que se valida segue sendo Outbox -> Harmonia -> gate, lido
+    # pela API com o proprio usuario de automacao.
+    local ITEM_OUT ITEM_OK=0
+    ITEM_OUT=$(ritmo_exec <<PYEOF
+def main():
+    import frappe
+    try:
+        frappe.get_doc({"doctype": "Item", "item_code": "${CODE}", "item_name": "${CODE}", "item_group": "${GRP}", "stock_uom": "Nos", "is_stock_item": 0}).insert(ignore_permissions=True)
+        frappe.db.commit()
+        print("SYNAPSE_KV|item|criado")
+    except Exception as e:
+        frappe.db.rollback()
+        print("SYNAPSE_KV|item_erro|" + repr(e)[:300])
+PYEOF
+)
+    grep -q 'SYNAPSE_KV|item|criado' <<<"$ITEM_OUT" && ITEM_OK=1
+    local i ST="" GA="" N_TENT=40
+    [ "$ITEM_OK" = 1 ] || N_TENT=0
+    for i in $(seq 1 "$N_TENT"); do
       R=$(curl -s -m 30 -H "$AUTH" -G "https://${DOMINIO_ERP}/api/resource/Synapse%20Outbox" --data-urlencode "filters=[[\"entity_id\",\"=\",\"${CODE}\"]]" --data-urlencode 'fields=["status","gate_action","event_type"]' | python3 -c "import sys,json
 try:
   d=json.load(sys.stdin)['data']; print((d[0]['status']+'|'+str(d[0].get('gate_action'))) if d else '')
@@ -450,25 +468,47 @@ except Exception: print('')")
       sleep 6
     done
     if [ "$ST" = "PROCESSED" ]; then cancao_check PASS "ciclo Ritmo->Outbox->Harmonia->gate" "evento de ${CODE} PROCESSED (gate=${GA})"
+    elif [ "$ITEM_OK" != 1 ]; then cancao_check FAIL "ciclo Ritmo->Outbox->Harmonia->gate" "nao consegui criar o Item de teste: $(grep -o 'item_erro|.*' <<<"$ITEM_OUT" | head -1 | cut -c1-300)"
     else cancao_check FAIL "ciclo Ritmo->Outbox->Harmonia->gate" "evento de ${CODE} terminou em '${ST:-ausente}' apos ~4 min (relay do Outbox, webhook da Harmonia ou ACK falhou)"; fi
-    curl -s -m 30 -o /dev/null -H "$AUTH" -X DELETE "https://${DOMINIO_ERP}/api/resource/Item/${CODE}"
+    ritmo_exec >/dev/null 2>&1 <<PYEOF
+def main():
+    import frappe
+    if frappe.db.exists("Item", "${CODE}"):
+        frappe.delete_doc("Item", "${CODE}", force=1, ignore_permissions=True)
+        frappe.db.commit()
+PYEOF
   fi
   # 4) Lyra Central: rota /v1/decide instalada e autenticada (evento de controle - nao depende do Gemini)
   local LK="${LYRA_API_KEY:-${LYRA_TENANT_API_KEY:-}}" LT="${LYRA_TENANT_ID:-${TENANT_ID:-}}" LU="${LYRA_CENTRAL_URL:-}"
   if [ -n "$LK" ] && [ -n "$LT" ] && [ -n "$LU" ]; then
+    local DECIDE_BODY='{"event":{"event_id":"smoke","event_type":"intent_expired","entity_type":"Item","entity_id":"X","state_version":1,"payload":{"operation_id":"smoke","conversa_id":"0"}}}'
+    local R_LOCAL; R_LOCAL=$(curl -s -m 30 -X POST "http://127.0.0.1:8080/v1/decide" -H "Authorization: Bearer ${LK}" -H "X-Tenant-ID: ${LT}" -H 'Content-Type: application/json' -d "$DECIDE_BODY" | python3 -c "import sys,json
+try:
+  d=json.load(sys.stdin); print('ok' if d.get('notifications') and d['notifications'][0]['kind']=='reconfirm_intent' else 'resposta inesperada')
+except Exception: print('sem JSON')")
     R=$(curl -s -m 30 -X POST "${LU}/v1/decide" -H "Authorization: Bearer ${LK}" -H "X-Tenant-ID: ${LT}" -H 'Content-Type: application/json' \
       -d '{"event":{"event_id":"smoke","event_type":"intent_expired","entity_type":"Item","entity_id":"X","state_version":1,"payload":{"operation_id":"smoke","conversa_id":"0"}}}' | python3 -c "import sys,json
 try:
   d=json.load(sys.stdin); print('ok' if d.get('notifications') and d['notifications'][0]['kind']=='reconfirm_intent' else 'resposta inesperada')
 except Exception: print('sem JSON (rota /v1/decide ausente?)')")
-    [ "$R" = "ok" ] && cancao_check PASS "Lyra /v1/decide" "rota ativa e autenticada" || cancao_check FAIL "Lyra /v1/decide" "$R"
+    if [ "$R" = "ok" ]; then cancao_check PASS "Lyra /v1/decide" "rota ativa e autenticada"
+    elif [ "$R_LOCAL" = "ok" ]; then cancao_check FAIL "Lyra /v1/decide" "a rota funciona LOCALMENTE (127.0.0.1:8080), mas ${LU} nao responde: problema de certificado/DNS/Traefik (o n8n chama a Lyra por esse URL)"
+    else cancao_check FAIL "Lyra /v1/decide" "publico: ${R}; local: ${R_LOCAL}"; fi
   else
     cancao_check FAIL "Lyra /v1/decide" "credenciais/URL da Lyra Central ausentes para o teste"
   fi
   # 5) Painel publicado com Aprovar/Rejeitar
   if [ -n "${DOMINIO_PAINEL:-}" ]; then
-    curl -s -m 30 "https://${DOMINIO_PAINEL}/" | grep -q 'page-aprovacoes' && cancao_check PASS "Painel Aprovar/Rejeitar" "publicado em https://${DOMINIO_PAINEL}" \
-      || cancao_check FAIL "Painel Aprovar/Rejeitar" "a pagina publicada nao contem a aba Aprovacoes"
+    # Captura a pagina ANTES do grep: "curl | grep -q" com pipefail da falso negativo, porque o grep
+    # sai no 1o match e o curl (pagina de ~450 KB) leva SIGPIPE (erro 23) - falhava 5/5 mesmo com a aba la.
+    local PAGINA_PAINEL; PAGINA_PAINEL="$(curl -s -m 30 "https://${DOMINIO_PAINEL}/" 2>/dev/null)"
+    if [ -z "$PAGINA_PAINEL" ]; then
+      cancao_check FAIL "Painel Aprovar/Rejeitar" "https://${DOMINIO_PAINEL} nao respondeu (certificado/DNS - veja o diagnostico do Traefik acima)"
+    elif grep -q 'page-aprovacoes' <<<"$PAGINA_PAINEL"; then
+      cancao_check PASS "Painel Aprovar/Rejeitar" "publicado em https://${DOMINIO_PAINEL}"
+    else
+      cancao_check FAIL "Painel Aprovar/Rejeitar" "a pagina publicada nao contem a aba Aprovacoes"
+    fi
   fi
 }
 # n8n <-> Semaphore (so Nomen): grava no .env do Harmonia o contrato da Integration (token/paths gerados pelo script do
@@ -572,6 +612,22 @@ ritmo_exec() {
   docker exec -u frappe ritmo-backend-1 bash -c "cd /home/frappe/frappe-bench && bench --site ${DOMINIO_ERP} execute frappe.${mod}.main" 2>&1
   docker exec -u frappe ritmo-backend-1 rm -f "/home/frappe/frappe-bench/apps/frappe/frappe/${mod}.py" 2>/dev/null || true
   rm -f "$tmp"
+}
+
+# Mostra o erro ACME COMPLETO de um dominio. "429" = limite do Let's Encrypt (falhas de validacao por
+# hora, certificados duplicados por semana ou por dominio registrado): so passa com o tempo, e cada
+# nova rodada/restart do Traefik gasta mais cota. A mensagem traz o "retry after".
+acme_diagnostico() {
+  local h="$1" linha
+  linha="$(docker logs traefik 2>&1 | grep -F -- "$h" | grep -iE 'unable to obtain|acme|ratelimited|429' | tail -1)"
+  if [ -n "$linha" ]; then
+    warn "  Traefik/ACME (${h}): $(echo "$linha" | cut -c1-900)"
+    if grep -qE '429|rateLimited' <<<"$linha"; then
+      warn "  >> 429 = LIMITE DO LET'S ENCRYPT. Leia o 'retry after' acima e AGUARDE esse horario antes de reexecutar; nao apague o volume traefik_certs nem reinicie o Traefik em loop. Se for 'failed authorizations', confira o DNS de ${h}."
+    fi
+  else
+    warn "  Traefik/ACME (${h}): nenhum erro ACME recente nos logs (confira: docker logs traefik --tail 50)"
+  fi
 }
 
 # O "bench list-apps" do Frappe v15 NAO imprime so o nome do app: cada linha e
@@ -2620,7 +2676,7 @@ EOF
   if [ "$PAINEL_H_HTTPS" != "$PAINEL_H_HOST" ]; then
     warn "  curl: $(curl -sS -m 8 -o /dev/null "https://${DOMINIO_PAINEL}/" 2>&1 | tail -1 | cut -c1-200)"
     warn "  DNS de ${DOMINIO_PAINEL}: $(getent ahostsv4 "${DOMINIO_PAINEL}" 2>/dev/null | awk 'NR==1{print $1}') (deve ser o IP publico desta VPS)"
-    warn "  Traefik: $(docker logs traefik 2>&1 | grep -iE 'acme|unable to obtain|certificate' | tail -2 | cut -c1-220 | tr '\n' ' ')"
+    acme_diagnostico "${DOMINIO_PAINEL}"
   fi
   log "PANEL_DEPLOY_OK candidato — host_hash=${PAINEL_H_HOST} container_hash=${PAINEL_H_CONT:-vazio} https_hash=${PAINEL_H_HTTPS:-vazio}"
   if [ -n "$PAINEL_H_HOST" ] && [ "$PAINEL_H_HOST" = "$PAINEL_H_CONT" ] && [ "$PAINEL_H_HOST" = "$PAINEL_H_HTTPS" ]; then
@@ -3307,7 +3363,7 @@ check_service() {
       local h="${url#https://}"; h="${h%%/*}"
       warn "  curl: $(curl -sS -m 8 -o /dev/null "$url" 2>&1 | tail -1 | cut -c1-200)"
       warn "  DNS de ${h}: $(getent ahostsv4 "$h" 2>/dev/null | awk 'NR==1{print $1}') (deve ser o IP publico desta VPS)"
-      warn "  Traefik: $(docker logs traefik 2>&1 | grep -iE 'acme|unable to obtain|certificate' | tail -2 | cut -c1-220 | tr '\n' ' ')" ;;
+      acme_diagnostico "$h" ;;
     esac
   fi
 }
