@@ -776,6 +776,20 @@ fi
 log "Criando rede unificada stack-network..."
 docker network create stack-network 2>/dev/null || true
 
+# O Traefik (container) chega na Lyra Central (processo no HOST, porta 8080) via
+# host.docker.internal. Para o host isso e trafego de ENTRADA vindo da rede docker, e o ufw
+# (so 22/80/443) o descarta em silencio: o HTTPS publico da Lyra fica pendurado (curl: timeout
+# com 0 bytes) mesmo com a Lyra saudavel em 127.0.0.1:8080. Liberamos SO a sub-rede da
+# stack-network, so na porta 8080 - a Lyra continua nao exposta na internet.
+STACK_SUBNET="$(docker network inspect stack-network -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null | tr ' ' '\n' | grep -m1 '\.')"
+if [ -n "$STACK_SUBNET" ]; then
+  ufw allow from "$STACK_SUBNET" to any port 8080 proto tcp comment 'Traefik -> Lyra Central' >/dev/null 2>&1 \
+    && ok "Firewall: ${STACK_SUBNET} (stack-network) -> porta 8080 liberada so para o Traefik alcancar a Lyra Central" \
+    || warn "Nao consegui criar a regra ufw ${STACK_SUBNET} -> 8080 (rode: ufw allow from ${STACK_SUBNET} to any port 8080 proto tcp)"
+else
+  warn "Nao consegui obter a sub-rede da stack-network; sem a regra ufw o HTTPS da Lyra pode ficar pendurado."
+fi
+
 log "Instalando Traefik (único, docker + file provider)..."
 mkdir -p /home/ubuntu/traefik/dynamic
 cat > /home/ubuntu/traefik/docker-compose.yml << EOF
@@ -3298,6 +3312,12 @@ check_service() {
   fi
 }
 check_service "Lyra Central — local"       "http://127.0.0.1:8080/healthz"
+# O Traefik alcanca a Lyra (no host) pelo host.docker.internal? Se nao, o HTTPS publico fica pendurado.
+if docker exec traefik wget -q -T 5 -O /dev/null "http://host.docker.internal:8080/healthz" 2>/dev/null; then
+  ok "Traefik alcanca a Lyra Central no host (host.docker.internal:8080)"
+else
+  warn "Traefik NAO alcanca a Lyra Central em host.docker.internal:8080 — normalmente e o ufw. Veja: ufw status | grep 8080 ; docker exec traefik wget -T5 -O- http://host.docker.internal:8080/healthz"
+fi
 check_service "Lyra Central — pública"     "https://${DOMINIO_LYRA}/healthz"
 
 # GEMINI_API_KEY/GEMINI_MODEL: confirma que estão gravados no .env real da
